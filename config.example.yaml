@@ -1,0 +1,51 @@
+# ShareLLM Smart Gateway — reference configuration.
+#
+# This file is the canonical example the rest of the gateway is built from.
+# It defines two upstream providers and two multi-target failover routes.
+# Copy it to `config.yaml` and replace the placeholder API keys with real ones.
+
+gateway:
+  host: 127.0.0.1
+  port: 8000
+  log_level: info
+
+providers:
+  # Primary provider: a native ShareLLM endpoint.
+  sharellm_primary:
+    type: sharellm
+    base_url: https://api.sharellm.example.com/v1
+    api_key: sk-sharellm-REPLACE_WITH_REAL_KEY
+
+  # Backup provider: an OpenAI-compatible aggregator.
+  openrouter_backup:
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key: sk-or-REPLACE_WITH_REAL_KEY
+
+routes:
+  # Coding traffic: prefer the primary, fall back to the backup.
+  coding_route:
+    models:
+      - "gpt-6.1-sol"
+      - "gpt-6-astra"
+    strategy: failover
+    targets:
+      - provider: sharellm_primary
+        model: "gpt-6.1-sol"
+        timeout_seconds: 15.0
+      - provider: openrouter_backup
+        model: "gpt-6-astra"
+        timeout_seconds: 30.0
+
+  # General chat traffic: same failover shape, lower-latency primary budget.
+  chat_route:
+    models:
+      - "gpt-6.1-sol"
+    strategy: failover
+    targets:
+      - provider: sharellm_primary
+        model: "gpt-6.1-sol"
+        timeout_seconds: 10.0
+      - provider: openrouter_backup
+        model: "gpt-6-astra"
+        timeout_seconds: 20.0
