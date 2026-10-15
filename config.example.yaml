@@ -13,7 +13,7 @@ providers:
   # Primary provider: a native ShareLLM endpoint.
   sharellm_primary:
     type: sharellm
-    base_url: https://api.sharellm.example.com/v1
+    base_url: https://sharellm.net/v1
     api_key: sk-sharellm-REPLACE_WITH_REAL_KEY
 
   # Backup provider: an OpenAI-compatible aggregator.
