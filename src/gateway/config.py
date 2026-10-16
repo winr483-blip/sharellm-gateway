@@ -19,7 +19,7 @@ Broken provider references are rejected in two complementary layers:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Literal, Mapping, TypeAlias
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -30,8 +30,11 @@ __all__ = [
     "ProviderConfig",
     "RouteConfig",
     "RouteTargetConfig",
+    "RoutingProfile",
     "load_config",
 ]
+
+RoutingProfile: TypeAlias = Literal["budget", "balanced", "performance"]
 
 
 class GatewayServerConfig(BaseModel):
@@ -103,9 +106,21 @@ class RouteConfig(BaseModel):
         description="Routing strategy used across this route's targets.",
     )
     targets: list[RouteTargetConfig] = Field(
-        min_length=1,
+        default_factory=list,
         description="Ordered list of upstream targets; earlier entries are tried first.",
     )
+    routing_profile: RoutingProfile = "balanced"
+    channel_targets: dict[str, RouteTargetConfig] = Field(default_factory=dict)
+    match_limit: int = Field(default=3, gt=0, strict=True)
+
+    @model_validator(mode="after")
+    def _validate_strategy_targets(self) -> RouteConfig:
+        if self.strategy == "matchmaker":
+            if not self.channel_targets:
+                raise ValueError("Matchmaker routes require nonempty channel_targets")
+        elif not self.targets:
+            raise ValueError("Static routes require at least one target")
+        return self
 
 
 class AppConfig(BaseModel):
@@ -125,6 +140,8 @@ class AppConfig(BaseModel):
         default_factory=dict,
         description="Named routing rules, keyed by route name.",
     )
+
+    registry_db_path: str = "data/registry.db"
 
     @model_validator(mode="after")
     def _validate_provider_references(self) -> AppConfig:
@@ -162,7 +179,7 @@ def _assert_provider_references(
     """
     known_providers = sorted(providers)
     for route_name, route in routes.items():
-        for target in route.targets:
+        for target in [*route.targets, *route.channel_targets.values()]:
             if target.provider not in providers:
                 raise ValueError(
                     _unknown_provider_message(route_name, target.provider, known_providers)
@@ -202,9 +219,11 @@ def _assert_raw_provider_references(raw: Mapping[str, Any]) -> None:
         if not isinstance(route_raw, Mapping):
             continue
         targets_raw = route_raw.get("targets")
-        if not isinstance(targets_raw, list):
-            continue
-        for target_raw in targets_raw:
+        bindings_raw = route_raw.get("channel_targets")
+        candidates = list(targets_raw) if isinstance(targets_raw, list) else []
+        if isinstance(bindings_raw, Mapping):
+            candidates.extend(bindings_raw.values())
+        for target_raw in candidates:
             if not isinstance(target_raw, Mapping):
                 continue
             provider = target_raw.get("provider")
@@ -258,4 +277,9 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         )
 
     _assert_raw_provider_references(raw)
-    return AppConfig.model_validate(raw)
+    config = AppConfig.model_validate(raw)
+    # All relative registry paths (including the default) are config-relative.
+    db_path = Path(config.registry_db_path)
+    if not db_path.is_absolute():
+        config.registry_db_path = str((config_path.resolve().parent / db_path).resolve())
+    return config

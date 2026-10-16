@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -35,7 +35,7 @@ from typing import Any, AsyncIterator
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.responses import Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
@@ -47,8 +47,15 @@ from gateway.adapters.sharellm import (
     sanitize_error_envelope,
 )
 from gateway.config import AppConfig, RouteConfig, load_config
+from gateway.engine.registry.matcher import ChannelMatcher
+from gateway.engine.registry import ChannelRegistryStorage
 from gateway.engine.proxy import JSONValue
 from gateway.engine.router import CooldownRegistry, dispatch
+from gateway.engine.registry.models import ChannelNode
+from gateway.engine.telemetry import (
+    DashboardTelemetry, DispatchObservation, PRICING_NOTE, account_body,
+    observe_stream, savings_channel,
+)
 
 __all__ = [
     "app",
@@ -105,9 +112,9 @@ class _ReleasingStreamingResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            body_iterator = self.body_iterator
-            if isinstance(body_iterator, AsyncGenerator):
-                await body_iterator.aclose()
+            close = getattr(self.body_iterator, "aclose", None)
+            if close is not None:
+                await close()
 
 
 def _error_response(status_code: int, message: str) -> JSONResponse:
@@ -199,16 +206,110 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
         application.state.app_config = config
         application.state.http_client = http_client
         application.state.cooldown_registry = CooldownRegistry()
+        storage: ChannelRegistryStorage | None = None
+        matchers: dict[int, ChannelMatcher] = {}
+        application.state.channel_matchers = matchers
         try:
+            dynamic_routes = [route for route in config.routes.values() if route.strategy == "matchmaker"]
+            application.state.dashboard_telemetry = DashboardTelemetry(
+                dynamic_routes[0].routing_profile if dynamic_routes else "balanced"
+            )
+            application.state.channel_registry = None
+            if dynamic_routes:
+                storage = ChannelRegistryStorage(config.registry_db_path)
+                application.state.channel_registry = storage
+                await storage.initialize()
+                for route in dynamic_routes:
+                    matchers[id(route)] = ChannelMatcher(storage, route.channel_targets)
+            application.state.dashboard_ready = True
             yield
         finally:
-            await http_client.aclose()
+            application.state.dashboard_ready = False
+            try:
+                if storage is not None:
+                    await storage.close()
+            finally:
+                await http_client.aclose()
 
     application = FastAPI(
         title="ShareLLM Smart Gateway",
         version=GATEWAY_VERSION,
         lifespan=lifespan,
     )
+
+    @application.get("/")
+    @application.get("/dashboard")
+    async def dashboard() -> FileResponse:
+        return FileResponse(Path(__file__).parent / "ui" / "dashboard.html", media_type="text/html")
+
+    @application.get("/v1/dashboard/stats")
+    async def dashboard_stats(request: Request) -> Response:
+        if not getattr(request.app.state, "dashboard_ready", False):
+            return _error_response(503, "Dashboard is unavailable.")
+        telemetry: DashboardTelemetry = request.app.state.dashboard_telemetry
+        return JSONResponse({**telemetry.snapshot(), "version": GATEWAY_VERSION})
+
+    @application.post("/v1/dashboard/profile")
+    async def dashboard_profile(request: Request) -> Response:
+        if not getattr(request.app.state, "dashboard_ready", False):
+            return _error_response(503, "Dashboard is unavailable.")
+        # Local API has no new authentication requirement, but browsers may not
+        # mutate the profile on behalf of a hostile cross-site page.
+        origin = request.headers.get("origin")
+        if (request.headers.get("sec-fetch-site") not in (None, "same-origin", "none")
+                or (origin is not None and origin != str(request.base_url).rstrip("/"))):
+            return _error_response(403, "Cross-origin profile changes are not allowed.")
+        try:
+            payload: object = await request.json()
+        except ValueError:
+            return _error_response(400, "Profile body must be valid JSON.")
+        if not isinstance(payload, dict) or set(payload) != {"profile"}:
+            return _error_response(400, "Expected only a profile field.")
+        profile = payload["profile"]
+        if profile not in ("budget", "balanced", "performance"):
+            return _error_response(400, "Unknown routing profile.")
+        telemetry: DashboardTelemetry = request.app.state.dashboard_telemetry
+        if profile == "budget":
+            telemetry.switch_profile("budget")
+        elif profile == "performance":
+            telemetry.switch_profile("performance")
+        else:
+            telemetry.switch_profile("balanced")
+        return JSONResponse({"active_profile": telemetry.active_profile})
+
+    @application.get("/v1/dashboard/channels")
+    async def dashboard_channels(request: Request) -> Response:
+        if not getattr(request.app.state, "dashboard_ready", False):
+            return _error_response(503, "Dashboard is unavailable.")
+        storage: ChannelRegistryStorage | None = request.app.state.channel_registry
+        cards: list[ChannelNode] = []
+        if storage is not None:
+            try:
+                cards = await storage.list_channels()
+            except Exception:
+                return _error_response(503, "Channel registry is unavailable.")
+        config: AppConfig = request.app.state.app_config
+        registry: CooldownRegistry = request.app.state.cooldown_registry
+        rows: list[dict[str, Any]] = []
+        for card in cards:
+            bindings = [route.channel_targets[card.channel_id]
+                        for route in config.routes.values()
+                        if route.strategy == "matchmaker" and card.model_name in route.models
+                        and card.channel_id in route.channel_targets]
+            rows.append({
+                "channel_id": card.channel_id, "model_name": card.model_name,
+                "publisher": card.publisher, "is_certified": card.is_certified,
+                "first_token_latency": card.metrics.first_token_latency,
+                "tps": card.metrics.tps, "sla_realtime": card.metrics.sla_realtime,
+                "sla_24h": card.metrics.sla_24h, "sla_7d": card.metrics.sla_7d,
+                "community_hearts": card.metrics.community_hearts,
+                "fingerprint_status": card.authenticity.fingerprint_status,
+                "bound": bool(bindings), "bound_target_count": len({(b.provider, b.model) for b in bindings}),
+                "cooldown": any(registry.is_cooling(target) for target in bindings),
+            })
+        return JSONResponse({"channels": rows,
+                             "metrics_scope": "Latest persisted registry values; not live measured SLA or TPS.",
+                             "pricing_note": PRICING_NOTE})
 
     @application.get("/health")
     async def health() -> dict[str, str]:
@@ -227,6 +328,12 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
     @application.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
         """Proxy a chat-completions call to its route with resilient failover."""
+        telemetry: DashboardTelemetry = request.app.state.dashboard_telemetry
+        telemetry.total_requests += 1
+        # Capture at entry: a profile switch during request parsing/selection or
+        # upstream I/O affects only subsequent requests.
+        profile_override = telemetry.profile_override
+        observation = DispatchObservation(telemetry)
         try:
             payload: object = await request.json()
         except ValueError:
@@ -253,6 +360,19 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
         http_client: httpx.AsyncClient = request.app.state.http_client
         registry: CooldownRegistry = request.app.state.cooldown_registry
         headers = dict(request.headers)
+        matchers: dict[int, ChannelMatcher] = request.app.state.channel_matchers
+        matcher = matchers.get(id(route))
+        if route.strategy == "matchmaker" and profile_override is not None:
+            route = route.model_copy(update={"routing_profile": profile_override})
+        # Optional price snapshot is independent of selection and never runs on
+        # static paths; failure makes savings unpriced, not the relay unavailable.
+        cards: list[ChannelNode] = []
+        storage: ChannelRegistryStorage | None = request.app.state.channel_registry
+        if route.strategy == "matchmaker" and storage is not None:
+            try:
+                cards = await storage.get_channels_for_model(model)
+            except Exception:
+                pass
 
         # Sanitize the *request* first (per-request, provider-agnostic), then
         # let the failover engine rewrite `model` per target (per-attempt). The
@@ -268,7 +388,7 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
                 response_headers,
                 chunk_iterator,
             ), _provider_name = await dispatch(
-                http_client, route, config, sanitized_payload, True, headers, registry
+                http_client, route, config, sanitized_payload, True, headers, registry, matcher, observation
             )
             if chunk_iterator is None:
                 # Every target failed (or the last one returned a retryable
@@ -279,8 +399,9 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
                     content=_normalize_error_body(status_code, error_body),
                     headers=response_headers,
                 )
+            card = savings_channel(route, model, cards, observation.serving_target)
             return _ReleasingStreamingResponse(
-                chunk_iterator,
+                observe_stream(chunk_iterator, telemetry, card) if status_code < 400 else chunk_iterator,
                 status_code=status_code,
                 headers=response_headers,
                 media_type="text/event-stream",
@@ -291,8 +412,10 @@ def create_app(config_path: str | Path | None = None) -> FastAPI:
             body,
             response_headers,
         ), provider_name = await dispatch(
-            http_client, route, config, sanitized_payload, False, headers, registry
+            http_client, route, config, sanitized_payload, False, headers, registry, matcher, observation
         )
+        if status_code < 400:
+            account_body(telemetry, body, savings_channel(route, model, cards, observation.serving_target))
         body = _normalize_error_body(status_code, body)
 
         # Cache telemetry applies to non-streaming success responses only, and

@@ -30,7 +30,10 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Literal, TypeAlias, overload
+from typing import Any, Callable, Literal, Sequence, TypeAlias, overload
+
+from gateway.engine.registry.matcher import ChannelMatcher
+from gateway.engine.telemetry import DispatchObservation
 
 import httpx
 
@@ -132,7 +135,7 @@ class CooldownRegistry:
 
 
 def _select_targets(
-    route: RouteConfig, registry: CooldownRegistry
+    resolved_targets: Sequence[RouteTargetConfig], registry: CooldownRegistry
 ) -> list[RouteTargetConfig]:
     """Return the targets to try, honouring the soft cooldown.
 
@@ -140,7 +143,7 @@ def _select_targets(
     target is cooling down, the full ordered list is returned so the request
     still has somewhere to go.
     """
-    targets = list(route.targets)
+    targets = list(resolved_targets)
     available = [target for target in targets if not registry.is_cooling(target)]
     return available if available else targets
 
@@ -197,6 +200,8 @@ async def dispatch(
     stream: Literal[False],
     headers: dict[str, str],
     registry: CooldownRegistry,
+    matcher: ChannelMatcher | None = None,
+    observation: DispatchObservation | None = None,
 ) -> BufferedDispatch: ...
 
 
@@ -209,6 +214,8 @@ async def dispatch(
     stream: Literal[True],
     headers: dict[str, str],
     registry: CooldownRegistry,
+    matcher: ChannelMatcher | None = None,
+    observation: DispatchObservation | None = None,
 ) -> StreamingDispatch: ...
 
 
@@ -220,6 +227,8 @@ async def dispatch(
     stream: bool,
     headers: dict[str, str],
     registry: CooldownRegistry,
+    matcher: ChannelMatcher | None = None,
+    observation: DispatchObservation | None = None,
 ) -> BufferedDispatch | StreamingDispatch:
     """Forward ``request_data`` down ``route`` with resilient failover.
 
@@ -245,12 +254,49 @@ async def dispatch(
         returned with the ``gateway_failover_exhausted`` envelope (and a ``None``
         chunk iterator for the streaming shape) and a ``None`` provider name.
     """
-    targets = _select_targets(route, registry)
+    resolved_targets = route.targets
+    if route.strategy == "matchmaker":
+        status, message = 503, "Channel matcher is unavailable"
+        if matcher is not None:
+            try:
+                resolved_targets = await matcher.select_targets(
+                    str(request_data.get("model", "")), route.routing_profile,
+                    request_data, route.match_limit,
+                )
+                message = "No eligible upstream targets"
+                if any(target.provider not in config.providers for target in resolved_targets):
+                    resolved_targets = []
+                    message = "Channel matcher returned an unknown provider"
+            except ValueError as exc:
+                status, message = 400, str(exc)
+                resolved_targets = []
+            except Exception:
+                logger.exception("Channel selection failed")
+                resolved_targets = []
+        else:
+            resolved_targets = []
+        if not resolved_targets:
+            error: dict[str, JSONValue] = {
+                "error": {"message": message, "type": "invalid_request_error" if status == 400 else "gateway_matchmaker_unavailable"}
+            }
+            if stream:
+                return (status, error, {}, None), None
+            return (status, error, {}), None
+    targets = _select_targets(resolved_targets, registry)
 
     last_status_code = _DEFAULT_FAILURE_STATUS_CODE
     last_headers: dict[str, str] = {}
 
+    pending_transition: tuple[RouteTargetConfig, str, float] | None = None
     for index, target in enumerate(targets):
+        # Publish only once the next selected target really enters its attempt.
+        if observation is not None and pending_transition is not None:
+            try:
+                source, reason, elapsed = pending_transition
+                observation.transition(source, target, reason, elapsed)
+            except Exception:
+                pass
+        started = time.monotonic()
         provider = config.providers[target.provider]
         remaining = len(targets) - index - 1
         # Per-target copy: rewriting ``model`` on the caller's own dict would
@@ -279,7 +325,8 @@ async def dispatch(
             )
             last_headers = {}
             registry.record_failure(target)
-            _log_failover(target, f"{type(exc).__name__}: {exc}", remaining)
+            _log_failover(target, type(exc).__name__, remaining)
+            pending_transition = (target, type(exc).__name__, max(0.0, (time.monotonic() - started) * 1000))
             continue
 
         if status_code in RETRYABLE_STATUS_CODES:
@@ -287,8 +334,14 @@ async def dispatch(
             last_headers = response_headers
             registry.record_failure(target)
             _log_failover(target, f"HTTP {status_code}", remaining)
+            pending_transition = (target, f"HTTP {status_code}", max(0.0, (time.monotonic() - started) * 1000))
             continue
 
+        if observation is not None and status_code < 400:
+            try:
+                observation.served(target)
+            except Exception:
+                pass
         # Success, or a non-retryable status: hand the upstream result straight
         # back — the remaining targets are deliberately not consumed.
         if stream:
